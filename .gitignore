@@ -1,0 +1,88 @@
+# .env
+API_KEY=your-very-long-random-secret-here-32-chars-minimum
+# Generate one: python -c "import secrets; print(secrets.token_urlsafe(48))"
+.env
+uploads/
+__pycache__/
+*.pyc
+# src/main.py
+from fastapi import FastAPI, File, UploadFile, HTTPException, Depends, Request
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.responses import JSONResponse
+from pathlib import Path
+import shutil
+import os
+from dotenv import load_dotenv
+
+load_dotenv()  # loads .env file
+
+app = FastAPI(
+    title="Policy Upload Endpoint",
+    description="Secure upload for AI governance/policy documents (NIST RMF aligned)",
+    version="0.1.0"
+)
+
+security = HTTPBearer()
+
+UPLOAD_DIR = Path("uploads")
+UPLOAD_DIR.mkdir(exist_ok=True)
+
+ALLOWED_EXTENSIONS = {".pdf", ".md", ".json", ".txt"}
+MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB
+
+# Load from .env — fallback only for local dev (remove in prod)
+EXPECTED_API_KEY = os.getenv("API_KEY")
+if not EXPECTED_API_KEY:
+    raise RuntimeError("API_KEY not set in environment variables")
+
+def verify_api_key(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    """Validate bearer token matches expected API key"""
+    if credentials.credentials != EXPECTED_API_KEY:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or missing API key",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return credentials.credentials
+
+@app.post("/upload-policy/")
+async def upload_policy(
+    file: UploadFile = File(...),
+    api_key: str = Depends(verify_api_key),           # enforces auth
+    request: Request = None                            # for future logging
+):
+    """
+    Upload a policy document.
+    Requires Authorization: Bearer <your-api-key> header.
+    """
+    # Basic file validation
+    ext = Path(file.filename).suffix.lower()
+    if ext not in ALLOWED_EXTENSIONS:
+        raise HTTPException(400, detail=f"Invalid file type. Allowed: {', '.join(ALLOWED_EXTENSIONS)}")
+
+    contents = await file.read()
+    if len(contents) > MAX_FILE_SIZE:
+        raise HTTPException(413, detail="File too large (>10MB)")
+
+    # Secure filename
+    safe_name = file.filename.replace("/", "_").replace("\\", "_")
+    timestamp = os.path.getctime(file.file.fileno()) if hasattr(file.file, 'fileno') else ""
+    unique_name = f"{timestamp}_{safe_name}" if timestamp else safe_name
+    file_path = UPLOAD_DIR / unique_name
+
+    # Save file
+    with file_path.open("wb") as buffer:
+        buffer.write(contents)
+
+    # Basic audit metadata (expand later with logging DB)
+    file_hash = hashlib.sha256(contents).hexdigest() if 'hashlib' in globals() else "not-computed"
+
+    return JSONResponse({
+        "status": "success",
+        "filename": unique_name,
+        "saved_path": str(file_path),
+        "size_bytes": len(contents),
+        "sha256": file_hash,
+        "uploaded_at": datetime.datetime.now().isoformat(),
+        "client_ip": request.client.host if request else "unknown"
+    })uvicorn src.main:app --reload
